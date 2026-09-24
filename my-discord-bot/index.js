@@ -1,4 +1,4 @@
-// index.js — Don't KYS Bot (con paginación ilimitada)
+// index.js — Don't KYS Bot (paginación ilimitada, config y media por servidor)
 require('dotenv').config();
 const {
   Client,
@@ -39,22 +39,41 @@ function downloadFile(url, destPath) {
 }
 
 // ---------------------------------------------
-//  CONFIGURACIÓN DE BOTONES (persistente en JSON)
+//  CONFIGURACIÓN DE BOTONES (persistente en JSON, por servidor)
+//  Estructura: { "<guildId>": { "<clipId>": { label, emoji, file } } }
 // ---------------------------------------------
 const CONFIG_PATH = path.join(__dirname, 'buttonConfig.json');
 
-function loadConfig() {
+function loadAllConfig() {
   if (fs.existsSync(CONFIG_PATH)) {
     return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
   }
   return {};
 }
 
-function saveConfig(config) {
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+function saveAllConfig(all) {
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(all, null, 2));
 }
 
-let buttonConfig = loadConfig();
+let allConfig = loadAllConfig();
+
+function getGuildConfig(guildId) {
+  if (!allConfig[guildId]) allConfig[guildId] = {};
+  return allConfig[guildId];
+}
+
+function saveGuildConfig(guildId, guildConfig) {
+  allConfig[guildId] = guildConfig;
+  saveAllConfig(allConfig);
+}
+
+// Cada servidor tiene su propia carpeta media/<guildId>/, así los archivos
+// (y sus nombres) nunca se pisan ni se comparten entre servidores.
+function mediaDir(guildId) {
+  const dir = path.join(__dirname, 'media', guildId);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
 
 // ---------------------------------------------
 //  CLIENTE DISCORD
@@ -132,14 +151,16 @@ function buildPageRows(config, page) {
 }
 
 // ---------------------------------------------
-//  HELPER: enviar panel cajadank
+//  HELPER: enviar panel cajadank (para un servidor puntual)
 // ---------------------------------------------
-async function sendCajaDank(target) {
-  if (Object.keys(buttonConfig).length === 0) {
-    return target.reply('📭 No hay clips cargados todavía. Usá `!addclip 🎵 Nombre` adjuntando un .mp3 para agregar uno.');
+async function sendCajaDank(target, guildId) {
+  const config = getGuildConfig(guildId);
+
+  if (Object.keys(config).length === 0) {
+    return target.reply('📭 No hay clips cargados todavía en este servidor. Usá `!addclip 🎵 Nombre` adjuntando un .mp3 para agregar uno.');
   }
-  const { rows, totalPages } = buildPageRows(buttonConfig, 0);
-  const total = Object.keys(buttonConfig).length;
+  const { rows, totalPages } = buildPageRows(config, 0);
+  const total = Object.keys(config).length;
   return target.reply({
     content: `🎵 Elegí un clip para reproducir en el canal de voz: *(${total} clips, ${totalPages} página${totalPages > 1 ? 's' : ''})*`,
     components: rows,
@@ -151,9 +172,10 @@ async function sendCajaDank(target) {
 // ---------------------------------------------
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
-  const msg  = message.content;
-  const args = msg.trim().split(/\s+/);
-  const cmd  = args[0].toLowerCase();
+  const msg     = message.content;
+  const args    = msg.trim().split(/\s+/);
+  const cmd     = args[0].toLowerCase();
+  const guildId = message.guildId; // null si es un DM
 
   // --- !ping ---
   if (cmd === '!ping') {
@@ -185,13 +207,20 @@ client.on('messageCreate', async message => {
     });
   }
 
+  // A partir de acá, todos los comandos de la cajadank necesitan un servidor
+  const cajaDankCommands = ['!cajadank', '!setbutton', '!addclip', '!removeclip', '!listclips', '!setfile'];
+  if (cajaDankCommands.includes(cmd) && !guildId) {
+    return message.reply('❌ Este comando solo funciona dentro de un servidor.');
+  }
+
   // -- !cajadank ------------------------------
   if (cmd === '!cajadank') {
-    return sendCajaDank(message);
+    return sendCajaDank(message, guildId);
   }
 
   // -- !setbutton <id> <emoji> <nombre> -------
   if (cmd === '!setbutton') {
+    const config = getGuildConfig(guildId);
     const id    = parseInt(args[1]);
     const emoji = args[2] ?? '🎵';
     const label = args.slice(3).join(' ');
@@ -203,77 +232,76 @@ client.on('messageCreate', async message => {
       return message.reply('❌ Usá: `!setbutton <id> <emoji> <nombre>`\nEjemplo: `!setbutton 3 🔥 Fuego épico`');
     }
 
-    buttonConfig[id] = {
+    config[id] = {
       label,
       emoji,
-      file: buttonConfig[id]?.file ?? `clip${id}.mp3`,
+      file: config[id]?.file ?? `clip${id}.mp3`,
     };
-    saveConfig(buttonConfig);
+    saveGuildConfig(guildId, config);
     await message.reply(`✅ Botón ${id} actualizado: ${emoji} ${label}`);
-    return sendCajaDank(message);
+    return sendCajaDank(message, guildId);
   }
 
   // -- !addclip <emoji> <nombre> [+ adjunto .mp3/.ogg/.wav] -
   if (cmd === '!addclip') {
+    const config = getGuildConfig(guildId);
     const emoji = args[1] ?? '🎵';
     const label = args.slice(2).join(' ');
 
-    const ids   = Object.keys(buttonConfig).map(Number);
+    const ids   = Object.keys(config).map(Number);
     const newId = ids.length > 0 ? Math.max(...ids) + 1 : 1;
 
     const attachment = message.attachments.first();
     const validExts  = ['.mp3', '.ogg', '.wav'];
     const hasAudio   = attachment && validExts.some(e => attachment.name.toLowerCase().endsWith(e));
     const fileName   = hasAudio ? attachment.name : `clip${newId}.mp3`;
-    const destPath   = path.join(__dirname, 'media', fileName);
+    const destPath   = path.join(mediaDir(guildId), fileName);
 
-    if (!fs.existsSync(path.join(__dirname, 'media'))) {
-      fs.mkdirSync(path.join(__dirname, 'media'));
-    }
-
-    buttonConfig[newId] = { label, emoji, file: fileName };
-    saveConfig(buttonConfig);
+    config[newId] = { label, emoji, file: fileName };
+    saveGuildConfig(guildId, config);
 
     if (hasAudio) {
       try {
         await message.reply(`⏳ Descargando \`${fileName}\`...`);
         await downloadFile(attachment.url, destPath);
-        await message.reply(`✅ Clip ${newId} guardado: ${emoji} **${label}** → \`media/${fileName}\``);
+        await message.reply(`✅ Clip ${newId} guardado: ${emoji} **${label}** → \`media/${guildId}/${fileName}\``);
       } catch (err) {
         console.error('Error descargando archivo:', err);
-        await message.reply(`⚠️ Clip ${newId} registrado pero falló la descarga. Subí \`${fileName}\` manualmente a \`media/\`.`);
+        await message.reply(`⚠️ Clip ${newId} registrado pero falló la descarga. Subí \`${fileName}\` manualmente a \`media/${guildId}/\`.`);
       }
     } else {
       await message.reply(
         `✅ Clip ${newId} registrado: ${emoji} **${label}**\n` +
         `💡 Tip: la próxima vez adjuntá el **.mp3** en el mismo mensaje y el bot lo descarga solo.\n` +
-        `📂 O subí manualmente el archivo a \`media/${fileName}\`.`
+        `📂 O subí manualmente el archivo a \`media/${guildId}/${fileName}\`.`
       );
     }
 
     // Mostrar el panel actualizado automáticamente
-    return sendCajaDank(message);
+    return sendCajaDank(message, guildId);
   }
 
   // -- !removeclip <id> -----------------------
   if (cmd === '!removeclip') {
+    const config = getGuildConfig(guildId);
     const id = parseInt(args[1]);
-    if (isNaN(id) || !buttonConfig[id]) {
+    if (isNaN(id) || !config[id]) {
       return message.reply('❌ ID de clip inválido o no existe.');
     }
-    const removed = buttonConfig[id];
-    delete buttonConfig[id];
-    saveConfig(buttonConfig);
+    const removed = config[id];
+    delete config[id];
+    saveGuildConfig(guildId, config);
     await message.reply(`🗑️ Clip ${id} (${removed.emoji} ${removed.label}) eliminado.`);
-    return sendCajaDank(message);
+    return sendCajaDank(message, guildId);
   }
 
   // -- !listclips -----------------------------
   if (cmd === '!listclips') {
-    const entries = Object.entries(buttonConfig).sort(([a], [b]) => Number(a) - Number(b));
+    const config = getGuildConfig(guildId);
+    const entries = Object.entries(config).sort(([a], [b]) => Number(a) - Number(b));
     const total = entries.length;
 
-    if (total === 0) return message.reply('📭 No hay clips configurados.');
+    if (total === 0) return message.reply('📭 No hay clips configurados en este servidor.');
 
     const CHUNK = 30;
     for (let i = 0; i < entries.length; i += CHUNK) {
@@ -287,18 +315,19 @@ client.on('messageCreate', async message => {
 
   // -- !setfile <id> <archivo.mp3> ------------
   if (cmd === '!setfile') {
+    const config = getGuildConfig(guildId);
     const id   = parseInt(args[1]);
     const file = args[2];
-    if (isNaN(id) || !buttonConfig[id]) {
+    if (isNaN(id) || !config[id]) {
       return message.reply('❌ ID inválido.');
     }
     if (!file || !file.match(/\.(mp3|ogg|wav)$/i)) {
       return message.reply('❌ Indicá un archivo .mp3/.ogg/.wav. Ej: `!setfile 3 sonido_nuevo.mp3`');
     }
-    buttonConfig[id].file = file;
-    saveConfig(buttonConfig);
-    await message.reply(`✅ Botón ${id} ahora reproduce \`${file}\`.`);
-    return sendCajaDank(message);
+    config[id].file = file;
+    saveGuildConfig(guildId, config);
+    await message.reply(`✅ Botón ${id} ahora reproduce \`${file}\` (buscado en \`media/${guildId}/\`).`);
+    return sendCajaDank(message, guildId);
   }
 
   // -- !purge <cantidad> ----------------------
@@ -349,6 +378,8 @@ client.on('messageCreate', async message => {
 \`!listclips\` — Ver todos los clips configurados
 \`!ping\` — Test de conexión
 \`!purge <cantidad>\` — Borrar mensajes del canal (máx. 100)
+
+Los clips son propios de cada servidor: lo que se agrega acá no aparece en otros servidores donde esté el bot.
     `.trim());
   }
 });
@@ -359,7 +390,12 @@ client.on('messageCreate', async message => {
 client.on('interactionCreate', async interaction => {
   if (!interaction.isButton()) return;
 
-  const id = interaction.customId;
+  const id      = interaction.customId;
+  const guildId = interaction.guildId;
+
+  if (!guildId) return;
+
+  const config = getGuildConfig(guildId);
 
   // -- Botones de paginación ------------------
   if (id.startsWith('page_prev_') || id.startsWith('page_next_')) {
@@ -368,8 +404,8 @@ client.on('interactionCreate', async interaction => {
     const currentPage = parseInt(id.split('_')[2]);
     const newPage     = id.startsWith('page_prev_') ? currentPage - 1 : currentPage + 1;
 
-    const { rows } = buildPageRows(buttonConfig, newPage);
-    const total      = Object.keys(buttonConfig).length;
+    const { rows } = buildPageRows(config, newPage);
+    const total      = Object.keys(config).length;
     const totalPages = Math.ceil(total / CLIPS_PER_PAGE);
 
     return interaction.editReply({
@@ -389,16 +425,16 @@ client.on('interactionCreate', async interaction => {
   await interaction.deferReply({ ephemeral: true });
 
   const clipId  = parseInt(id.split('_')[2]);
-  const clipCfg = buttonConfig[clipId];
+  const clipCfg = config[clipId];
 
   if (!clipCfg) {
-    return interaction.editReply('❌ Este clip no existe en la configuración.');
+    return interaction.editReply('❌ Este clip no existe en la configuración de este servidor.');
   }
 
-  const clipPath = path.join(__dirname, 'media', clipCfg.file);
+  const clipPath = path.join(mediaDir(guildId), clipCfg.file);
 
   if (!fs.existsSync(clipPath)) {
-    return interaction.editReply(`❌ Archivo no encontrado: \`media/${clipCfg.file}\``);
+    return interaction.editReply(`❌ Archivo no encontrado: \`media/${guildId}/${clipCfg.file}\``);
   }
 
   const voiceChannel = interaction.member.voice?.channel;

@@ -1,3 +1,3 @@
 media/
 .env
-buttonConfig.json
+node_modules/
